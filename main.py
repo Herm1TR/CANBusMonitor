@@ -45,7 +45,7 @@ class CANBusMonitor:
         self.TimerInterval = 10  # milliseconds
 
         # Replace DBC file path
-        self.db = cantools.database.load_file("E:\Hydrogen_Valley_Power\TOYOTA\can_toyota.dbc")
+        self.db = cantools.database.load_file("D:\Hydrogen_Valley_Power\TOYOTA\can_toyota.dbc")
 
         # Handle the receiving and transmitting text widget display
         self.message_handlers = {}
@@ -376,15 +376,15 @@ class CANBusMonitor:
         self.global_transmit_button.config(state=tk.DISABLED)
 
     def reset_all(self):
-        # Clear receive frame
+        # Clear receive tree
         for item in self.receive_tree.get_children():
             self.receive_tree.delete(item)
+        self.tree_item_map.clear()
 
-        # Clear message detail frame
-        for text_widget in self.message_details_texts.values():
-            text_widget.config(state=tk.NORMAL)
-            text_widget.delete('1.0', tk.END)
-            text_widget.config(state=tk.DISABLED)
+        # clear all widgets in message detail region
+        for widget in self.details_scrollable_frame.winfo_children():
+            widget.destroy()
+        self.message_details_texts.clear()
 
         # Clear transmit message configuration frame
         for config in self.message_configs:
@@ -426,7 +426,8 @@ class CANBusMonitor:
         while self.m_reading:
             stsResult = self.m_objPCANBasic.Read(self.PcanHandle)
             if stsResult[0] == PCAN_ERROR_OK:
-                self.process_message(stsResult[1])
+                can_msg, timestamp = stsResult[1], stsResult[2]
+                self.process_message(can_msg, timestamp)
             time.sleep(self.TimerInterval / 1000)  # Convert milliseconds to seconds
 
     def stop_reading(self):
@@ -443,54 +444,55 @@ class CANBusMonitor:
 
         return handle_message
 
-    def process_message(self, msg):
+    def process_message(self, msg, timestamp):
         try:
             handler = self.message_handlers.get(msg.ID)
             if handler:
                 can_msg_name = self.db.get_message_by_frame_id(msg.ID).name
                 can_data = bytes(msg.DATA)
                 parsed_data = self.db.decode_message(msg.ID, can_data)
-                # 將更新請求放入緩衝隊列
-                self.update_queue.put((msg, parsed_data, can_msg_name))
+
+                # 計算 cycle time
+                current_time = timestamp.micros + (timestamp.millis * 1000) + (
+                            timestamp.millis_overflow * 0x100000 * 1000)
+
+                if msg.ID in self.last_received_times:
+                    cycle_time = int((current_time - self.last_received_times[msg.ID]) / 1000)  # 轉換成毫秒
+                else:
+                    cycle_time = 0
+
+                self.last_received_times[msg.ID] = current_time
+
+                # 放入 UI 更新佇列
+                self.update_queue.put((msg, parsed_data, can_msg_name, cycle_time))
             else:
                 print(f"Unhandled message with ID: {msg.ID}")
         except cantools.CanError as e:
             print(f"Error parsing message: {e}")
         except Exception as e:
             print(f"Unexpected error: {e}")
+
     # ---------------------------------------------------------------------------------------------------------------- #
 
     # ------------------------------------------------ GUI Update ---------------------------------------------------- #
     def schedule_ui_update(self):
-        # 每 100 毫秒處理緩衝隊列中的更新
         try:
             while not self.update_queue.empty():
-                msg, parsed_data, can_msg_name = self.update_queue.get_nowait()
-                self.update_receive_frame(msg, parsed_data, can_msg_name)
+                msg, parsed_data, can_msg_name, cycle_time = self.update_queue.get_nowait()
+                self.update_receive_frame(msg, parsed_data, can_msg_name, cycle_time)
         except queue.Empty:
             pass
-        # 再次調用自身以形成循環
-        self.master.after(100, self.schedule_ui_update)
+        self.master.after(50, self.schedule_ui_update)
 
-    def update_receive_frame(self, msg, parsed_data, can_msg_name):
+    def update_receive_frame(self, msg, parsed_data, can_msg_name, cycle_time):
         # ------------------------------------------- Receive tree --------------------------------------------------- #
-        current_time = time.time()
-
-        # Calculate cycle time
-        if msg.ID in self.last_received_times:
-            cycle_time = int((current_time - self.last_received_times[msg.ID]) * 1000)  # Convert to milliseconds
-        else:
-            cycle_time = 0
-
-        self.last_received_times[msg.ID] = current_time
-
         new_values = [
             can_msg_name,
             hex(msg.ID),
             self.GetTypeString(msg.MSGTYPE),
             msg.LEN,
             " ".join([f"{b:02X}" for b in msg.DATA]),
-            cycle_time,  # Use the calculated cycle time
+            cycle_time,  # 用 PCAN API 計算的 cycle time
             1,
         ]
 
@@ -595,20 +597,27 @@ class CANBusMonitor:
         if not config:
             return
 
+        last_update_time = 0
+        update_interval = 0.2  # 每 200 毫秒更新一次
+
         while config['transmitting']:
             start_time = time.time()
 
             result = self.m_objPCANBasic.Write(self.PcanHandle, msg)
             if result != PCAN_ERROR_OK:
-                print(f"Failed to transmit message {config_id}: {self.m_objPCANBasic.GetErrorText(result, 0x09)}")
-                messagebox.showerror("Error", f"Failed to transmit message {config_id}: {self.m_objPCANBasic.GetErrorText(result, 0x09)}")
+                # 使用 master.after 呼叫 messagebox，確保在 UI 線程顯示
+                self.master.after(0, lambda: messagebox.showerror(
+                    "Error", f"Failed to transmit message {config_id}: {self.m_objPCANBasic.GetErrorText(result, 0x09)}"
+                ))
                 config['transmit_button']['text'] = "Start Transmitting"
                 break
 
-            # Update the display with the transmitted message details
-            self.master.after(0, self.update_transmitted_message_display, msg.ID, bytes(msg.DATA), signal_values)
+            # 只在間隔超過 update_interval 時更新 UI
+            if time.time() - last_update_time >= update_interval:
+                self.master.after(0, self.update_transmitted_message_display, msg.ID, bytes(msg.DATA), signal_values)
+                last_update_time = time.time()
 
-            # Sleep for the remaining time to maintain the interval
+            # 保持發送間隔
             elapsed_time = time.time() - start_time
             sleep_time = max(0, interval / 1000 - elapsed_time)
             time.sleep(sleep_time)
