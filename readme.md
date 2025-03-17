@@ -42,7 +42,7 @@ CAN Bus Monitor is a graphical tool for monitoring and interacting with CAN buse
 ## Usage
 1. Launch the application:
    ```
-   python GUI.py
+   python main.py
    ```
 
 2. Initialize the CAN connection:
