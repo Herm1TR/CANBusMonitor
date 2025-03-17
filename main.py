@@ -5,6 +5,7 @@ from PCANBasic import *
 import cantools
 import uuid
 import threading
+import queue
 
 
 class CANBusMonitor:
@@ -44,7 +45,7 @@ class CANBusMonitor:
         self.TimerInterval = 10  # milliseconds
 
         # Replace DBC file path
-        self.db = cantools.database.load_file("D:\Hydrogen_Valley_Power\Four_in_one\Four_in_one.dbc")
+        self.db = cantools.database.load_file("E:\Hydrogen_Valley_Power\TOYOTA\can_toyota.dbc")
 
         # Handle the receiving and transmitting text widget display
         self.message_handlers = {}
@@ -62,6 +63,8 @@ class CANBusMonitor:
 
         # Attribute to store receive and transmit message_details_text
         self.message_details_texts = {}
+
+        self.tree_item_map = {}  # 新增: CAN ID -> Treeview item 映射
 
         # Create main frames with specific weight ratios
         self.toolbar_frame = ttk.Frame(master)
@@ -88,6 +91,9 @@ class CANBusMonitor:
         # Disable receive and transmit button in the start
         self.start_stop_receive_button.config(state=tk.DISABLED)
         self.global_transmit_button.config(state=tk.DISABLED)
+
+        self.update_queue = queue.Queue()
+        self.schedule_ui_update()  # 啟動定時更新UI
 
 # -------------------------------------------------- GUI setup ------------------------------------------------------- #
     def create_toolbar(self):
@@ -444,8 +450,8 @@ class CANBusMonitor:
                 can_msg_name = self.db.get_message_by_frame_id(msg.ID).name
                 can_data = bytes(msg.DATA)
                 parsed_data = self.db.decode_message(msg.ID, can_data)
-
-                self.master.after(0, self.update_receive_frame, msg, parsed_data, can_msg_name)
+                # 將更新請求放入緩衝隊列
+                self.update_queue.put((msg, parsed_data, can_msg_name))
             else:
                 print(f"Unhandled message with ID: {msg.ID}")
         except cantools.CanError as e:
@@ -455,6 +461,17 @@ class CANBusMonitor:
     # ---------------------------------------------------------------------------------------------------------------- #
 
     # ------------------------------------------------ GUI Update ---------------------------------------------------- #
+    def schedule_ui_update(self):
+        # 每 100 毫秒處理緩衝隊列中的更新
+        try:
+            while not self.update_queue.empty():
+                msg, parsed_data, can_msg_name = self.update_queue.get_nowait()
+                self.update_receive_frame(msg, parsed_data, can_msg_name)
+        except queue.Empty:
+            pass
+        # 再次調用自身以形成循環
+        self.master.after(100, self.schedule_ui_update)
+
     def update_receive_frame(self, msg, parsed_data, can_msg_name):
         # ------------------------------------------- Receive tree --------------------------------------------------- #
         current_time = time.time()
@@ -467,13 +484,6 @@ class CANBusMonitor:
 
         self.last_received_times[msg.ID] = current_time
 
-        # Check if a row with this CAN ID already exists
-        existing_item = None
-        for item in self.receive_tree.get_children():
-            if self.receive_tree.item(item)['values'][1] == hex(msg.ID):
-                existing_item = item
-                break
-
         new_values = [
             can_msg_name,
             hex(msg.ID),
@@ -484,14 +494,14 @@ class CANBusMonitor:
             1,
         ]
 
-        if existing_item:
-            # Update existing row
-            current_values = self.receive_tree.item(existing_item)['values']
-            new_values[-1] = current_values[-1] + 1  # Increment count
-            self.receive_tree.item(existing_item, values=new_values)
+        if msg.ID in self.tree_item_map:
+            item = self.tree_item_map[msg.ID]
+            current_values = self.receive_tree.item(item)['values']
+            new_values[-1] = current_values[-1] + 1  # 更新計數
+            self.receive_tree.item(item, values=new_values)
         else:
-            # Insert new row
-            self.receive_tree.insert("", "end", values=new_values)
+            item = self.receive_tree.insert("", "end", values=new_values)
+            self.tree_item_map[msg.ID] = item
         # ------------------------------------------------------------------------------------------------------------ #
         # --------------------------------------------- Text Widget -------------------------------------------------- #
         # Update or create message details Text widget
@@ -565,9 +575,6 @@ class CANBusMonitor:
             msg.LEN = len(data)
             for i, byte in enumerate(data):
                 msg.DATA[i] = byte
-
-            # # Update the display with the initial transmission details
-            # self.update_transmitted_message_display(msg_id, data, signal_values)
 
             config['transmitting'] = True
             config['thread'] = threading.Thread(target=self.transmit_message_thread,
